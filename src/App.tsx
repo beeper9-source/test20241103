@@ -1,510 +1,526 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
 import './App.css'
-import {
-  CATEGORY_LABELS,
-  CULTURAL_NOTES,
-  CONVERSATION_PATTERNS,
-  DAILY_FOCUS,
-  MINI_LESSONS,
-  RESOURCE_LINKS,
-  SCENARIOS,
-  STUDY_ROUTINE,
-  VOCABULARY,
-  type Category,
-  type VocabularyItem,
-} from './data/lessons'
 
-type QuizQuestion = {
-  word: VocabularyItem
-  options: string[]
+type MessageStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'cancelled'
+
+type ScheduledMessage = {
+  id: string
+  message: string
+  scheduledAt: string
+  status: MessageStatus
+  createdAt: string
+  sentAt?: string
+  error?: string
 }
 
-const shuffle = <T,>(items: T[]): T[] => {
-  const result = [...items]
-  for (let i = result.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[result[i], result[j]] = [result[j], result[i]]
+const ACCESS_TOKEN_STORAGE_KEY = 'kakao-scheduler-access-token'
+const SCHEDULE_STORAGE_KEY = 'kakao-scheduler-schedules'
+const CHECK_INTERVAL_MS = 3000
+const DEFAULT_LINK = {
+  web_url: 'https://talk.kakao.com',
+  mobile_web_url: 'https://talk.kakao.com',
+}
+
+const padTime = (value: number) => value.toString().padStart(2, '0')
+
+const getDefaultDate = () => {
+  const now = new Date()
+  return `${now.getFullYear()}-${padTime(now.getMonth() + 1)}-${padTime(now.getDate())}`
+}
+
+const getDefaultTime = () => {
+  const now = new Date()
+  now.setMinutes(now.getMinutes() + 5)
+  return `${padTime(now.getHours())}:${padTime(now.getMinutes())}`
+}
+
+const formatDateTime = (iso: string) => {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return '알 수 없음'
+  return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })}`
+}
+
+const ensureValidDate = (date: string, fallback: string) => {
+  if (!date) return fallback
+  const [year, month, day] = date.split('-').map(Number)
+  if (!year || !month || !day) return fallback
+  return date
+}
+
+const ensureValidTime = (time: string, fallback: string) => {
+  if (!time) return fallback
+  const [hour, minute] = time.split(':').map(Number)
+  if (Number.isInteger(hour) && Number.isInteger(minute)) return time
+  return fallback
+}
+
+const buildScheduledDate = (date: string, time: string) => {
+  const [year, month, day] = date.split('-').map(Number)
+  const [hours, minutes] = time.split(':').map(Number)
+  const scheduled = new Date()
+  scheduled.setFullYear(year, month - 1, day)
+  scheduled.setHours(hours, minutes, 0, 0)
+  return scheduled
+}
+
+const loadToken = () => {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) ?? ''
+}
+
+const loadSchedules = (): ScheduledMessage[] => {
+  if (typeof window === 'undefined') return []
+  try {
+    const stored = window.localStorage.getItem(SCHEDULE_STORAGE_KEY)
+    if (!stored) return []
+    const parsed = JSON.parse(stored) as ScheduledMessage[]
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item) => ({
+      ...item,
+      status: item.status ?? 'pending',
+    }))
+  } catch (error) {
+    console.warn('예약 메시지 불러오기 실패', error)
+    return []
   }
-  return result
 }
 
-const createQuizQuestion = (): QuizQuestion => {
-  const word = VOCABULARY[Math.floor(Math.random() * VOCABULARY.length)]
-  const distractors = shuffle(
-    VOCABULARY.filter((item) => item.id !== word.id).map((item) => item.meaning),
-  ).slice(0, 3)
+const saveToken = (token: string) => {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token)
+}
 
-  return {
-    word,
-    options: shuffle([...distractors, word.meaning]),
+const saveSchedules = (schedules: ScheduledMessage[]) => {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(schedules))
+}
+
+const sendKakaoMemo = async (token: string, text: string) => {
+  const response = await fetch('https://kapi.kakao.com/v2/api/talk/memo/default/send', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+    },
+    body: new URLSearchParams({
+      template_object: JSON.stringify({
+        object_type: 'text',
+        text,
+        link: DEFAULT_LINK,
+      }),
+    }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '')
+    throw new Error(
+      `HTTP ${response.status}${errorText ? ` • ${errorText.slice(0, 200)}` : ''}`,
+    )
   }
-}
-
-const speechSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
-
-const createEmptyCategoryMap = () => {
-  return Object.keys(CATEGORY_LABELS).reduce((acc, key) => {
-    acc[key as Category] = []
-    return acc
-  }, {} as Record<Category, VocabularyItem[]>)
 }
 
 function App() {
-  const [currentCardIndex, setCurrentCardIndex] = useState(0)
-  const [quizQuestion, setQuizQuestion] = useState<QuizQuestion>(createQuizQuestion)
-  const [selectedOption, setSelectedOption] = useState<string | null>(null)
-  const [quizResult, setQuizResult] = useState<'correct' | 'incorrect' | null>(null)
-  const [knownWordIds, setKnownWordIds] = useState<number[]>(() => {
-    if (typeof window === 'undefined') return []
-    try {
-      const stored = window.localStorage.getItem('mandarin-known-words')
-      return stored ? (JSON.parse(stored) as number[]) : []
-    } catch (error) {
-      console.warn('Failed to parse stored known words', error)
-      return []
+  const [accessToken, setAccessToken] = useState<string>(() => loadToken())
+  const [message, setMessage] = useState('')
+  const [scheduleDate, setScheduleDate] = useState(() => getDefaultDate())
+  const [scheduleTime, setScheduleTime] = useState(() => getDefaultTime())
+  const [schedules, setSchedules] = useState<ScheduledMessage[]>(() => loadSchedules())
+  const [formError, setFormError] = useState<string | null>(null)
+  const [infoMessage, setInfoMessage] = useState<string | null>(null)
+  const [isSendingTest, setIsSendingTest] = useState(false)
+  const processingRef = useRef<Set<string>>(new Set())
+
+  useEffect(() => {
+    saveToken(accessToken)
+  }, [accessToken])
+
+  useEffect(() => {
+    saveSchedules(schedules)
+  }, [schedules])
+
+  useEffect(() => {
+    if (!accessToken) return
+
+    const tick = () => {
+      const now = Date.now()
+      const dueMessages = schedules.filter(
+        (item) =>
+          item.status === 'pending' &&
+          new Date(item.scheduledAt).getTime() <= now &&
+          !processingRef.current.has(item.id),
+      )
+
+      dueMessages.forEach((item) => {
+        void processMessage(item)
+      })
     }
-  })
-  const [notes, setNotes] = useState<string>(() => {
-    if (typeof window === 'undefined') return ''
-    return window.localStorage.getItem('mandarin-learning-notes') ?? ''
-  })
+
+    const interval = window.setInterval(tick, CHECK_INTERVAL_MS)
+    tick()
+
+    return () => window.clearInterval(interval)
+  }, [accessToken, schedules])
 
   useEffect(() => {
-    if (typeof window === 'undefined') return
-    window.localStorage.setItem('mandarin-known-words', JSON.stringify(knownWordIds))
-  }, [knownWordIds])
+    if (!formError) return
+    const timeout = window.setTimeout(() => setFormError(null), 4000)
+    return () => window.clearTimeout(timeout)
+  }, [formError])
 
   useEffect(() => {
-    if (typeof window === 'undefined') return
-    window.localStorage.setItem('mandarin-learning-notes', notes)
-  }, [notes])
+    if (!infoMessage) return
+    const timeout = window.setTimeout(() => setInfoMessage(null), 3000)
+    return () => window.clearTimeout(timeout)
+  }, [infoMessage])
 
-  const progress = useMemo(() => {
-    if (VOCABULARY.length === 0) return 0
-    return Math.round((knownWordIds.length / VOCABULARY.length) * 100)
-  }, [knownWordIds])
+  const pendingCount = useMemo(
+    () => schedules.filter((item) => item.status === 'pending').length,
+    [schedules],
+  )
 
-  const vocabularyByCategory = useMemo(() => {
-    return VOCABULARY.reduce<Record<Category, VocabularyItem[]>>((acc, item) => {
-      acc[item.category].push(item)
-      return acc
-    }, createEmptyCategoryMap())
-  }, [])
+  const buildScheduledMessage = (): ScheduledMessage | null => {
+    const safeDate = ensureValidDate(scheduleDate, getDefaultDate())
+    const safeTime = ensureValidTime(scheduleTime, getDefaultTime())
+    const scheduled = buildScheduledDate(safeDate, safeTime)
 
-  const currentCard = VOCABULARY[currentCardIndex]
-  const isCurrentWordKnown = knownWordIds.includes(currentCard.id)
+    if (Number.isNaN(scheduled.getTime())) {
+      setFormError('날짜와 시간이 올바르지 않습니다.')
+      return null
+    }
 
-  const speak = (text: string, lang: string = 'zh-CN') => {
-    if (!speechSupported) return
+    if (scheduled.getTime() < Date.now() + 5000) {
+      setFormError('예약 시간은 현재 시각보다 최소 5초 이상 뒤여야 합니다.')
+      return null
+    }
 
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = lang
-    window.speechSynthesis.cancel()
-    window.speechSynthesis.speak(utterance)
+    if (!accessToken.trim()) {
+      setFormError('카카오 액세스 토큰을 입력해주세요.')
+      return null
+    }
+
+    if (!message.trim()) {
+      setFormError('보낼 메시지를 입력해주세요.')
+      return null
+    }
+
+    if (message.length > 1000) {
+      setFormError('메시지는 1000자 이내여야 합니다.')
+      return null
+    }
+
+    const newMessage: ScheduledMessage = {
+      id: crypto.randomUUID(),
+      message: message.trim(),
+      scheduledAt: scheduled.toISOString(),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    }
+
+    return newMessage
   }
 
-  const handleNextCard = () => {
-    setCurrentCardIndex((prev) => (prev + 1) % VOCABULARY.length)
+  const handleScheduleMessage = () => {
+    const created = buildScheduledMessage()
+    if (!created) return
+
+    setSchedules((prev) => [...prev, created].sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt)))
+    setMessage('')
+    setInfoMessage('예약이 추가되었습니다.')
   }
 
-  const handlePrevCard = () => {
-    setCurrentCardIndex((prev) => (prev - 1 + VOCABULARY.length) % VOCABULARY.length)
+  const processMessage = async (item: ScheduledMessage) => {
+    if (!accessToken) return
+    processingRef.current.add(item.id)
+    setSchedules((prev) =>
+      prev.map((schedule) =>
+        schedule.id === item.id ? { ...schedule, status: 'sending', error: undefined } : schedule,
+      ),
+    )
+
+    try {
+      await sendKakaoMemo(accessToken, item.message)
+      setSchedules((prev) =>
+        prev.map((schedule) =>
+          schedule.id === item.id
+            ? { ...schedule, status: 'sent', sentAt: new Date().toISOString(), error: undefined }
+            : schedule,
+        ),
+      )
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : '알 수 없는 오류가 발생했습니다.'
+      setSchedules((prev) =>
+        prev.map((schedule) =>
+          schedule.id === item.id
+            ? { ...schedule, status: 'failed', error: message }
+            : schedule,
+        ),
+      )
+    } finally {
+      processingRef.current.delete(item.id)
+    }
   }
 
-  const toggleKnownWord = (wordId: number) => {
-    setKnownWordIds((prev) =>
-      prev.includes(wordId) ? prev.filter((id) => id !== wordId) : [...prev, wordId],
+  const handleSendNow = (id: string) => {
+    const target = schedules.find((item) => item.id === id)
+    if (!target || processingRef.current.has(id)) return
+    void processMessage(target)
+  }
+
+  const handleCancel = (id: string) => {
+    setSchedules((prev) =>
+      prev.map((item) =>
+        item.id === id && item.status === 'pending' ? { ...item, status: 'cancelled' } : item,
+      ),
     )
   }
 
-  const handleQuizOptionSelect = (option: string) => {
-    if (selectedOption) return
-    setSelectedOption(option)
-    setQuizResult(option === quizQuestion.word.meaning ? 'correct' : 'incorrect')
+  const handleDelete = (id: string) => {
+    setSchedules((prev) => prev.filter((item) => item.id !== id))
   }
 
-  const handleNextQuizQuestion = () => {
-    setQuizQuestion(createQuizQuestion())
-    setSelectedOption(null)
-    setQuizResult(null)
+  const handleRetry = (id: string) => {
+    const target = schedules.find((item) => item.id === id)
+    if (!target) return
+
+    setSchedules((prev) =>
+      prev.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              status: 'pending',
+              error: undefined,
+              scheduledAt: new Date(Date.now() + 5000).toISOString(),
+            }
+          : item,
+      ),
+    )
+    setInfoMessage('5초 뒤 재전송을 다시 시도합니다.')
+  }
+
+  const handleBulkClear = () => {
+    setSchedules((prev) => prev.filter((item) => item.status === 'pending' || item.status === 'sending'))
+  }
+
+  const handleTestSend = async () => {
+    if (!accessToken) {
+      setFormError('카카오 액세스 토큰을 입력해주세요.')
+      return
+    }
+
+    setIsSendingTest(true)
+    try {
+      await sendKakaoMemo(accessToken, '[테스트] 카카오톡 메시지 전송이 정상적으로 작동합니다.')
+      setInfoMessage('테스트 메시지를 보냈습니다.')
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : '테스트 메시지 전송 중 오류가 발생했습니다.'
+      setFormError(message)
+    } finally {
+      setIsSendingTest(false)
+    }
   }
 
   return (
     <div className="app">
-      <header className="hero">
-        <p className="hero__tag">10-minute daily Mandarin</p>
-        <h1>Nihao Chinese Lab</h1>
-        <p className="hero__subtitle">
-          Practice core vocabulary, real-life conversation patterns, and culture notes in one focused
-          study space.
-        </p>
-
-        <div className="hero__stats">
-          <div>
-            <span>{VOCABULARY.length}</span>
-            <p>Core words</p>
-          </div>
-          <div>
-            <span>{progress}%</span>
-            <p>Completion</p>
-          </div>
-          <div>
-            <span>{STUDY_ROUTINE.length}</span>
-            <p>Study routines</p>
-          </div>
+      <header className="header">
+        <div>
+          <h1>카카오톡 예약 메시지</h1>
+          <p className="header__subtitle">
+            Kakao Developers에서 발급한 사용자 액세스 토큰을 이용해 나에게 메시지를 예약 발송합니다.
+            창을 닫으면 예약 실행이 중단되므로 백그라운드 작업이 필요하면 별도 서버를 구성하세요.
+          </p>
+        </div>
+        <div className="header__status">
+          <span className="header__status-value">{pendingCount}</span>
+          <span className="header__status-label">대기 중 예약</span>
         </div>
       </header>
 
-      <main className="content">
-        <section className="card daily-focus">
-          <div className="section-header">
-            <h2>Daily focus</h2>
-            <span className="badge">{DAILY_FOCUS.theme}</span>
+      <main className="main">
+        <section className="card">
+          <h2>액세스 토큰</h2>
+          <p className="card__description">
+            카카오 인증 과정을 통해 발급받은 사용자 액세스 토큰을 입력하세요. 토큰은 로컬 스토리지에만
+            저장됩니다.
+          </p>
+          <div className="field">
+            <label htmlFor="token">REST API 액세스 토큰</label>
+            <textarea
+              id="token"
+              value={accessToken}
+              onChange={(event) => setAccessToken(event.target.value)}
+              placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+              spellCheck={false}
+              rows={3}
+            />
           </div>
-          <div className="daily-focus__phrase">
-            <div>
-              <p className="phrase">{DAILY_FOCUS.phrase}</p>
-              <p className="pinyin">{DAILY_FOCUS.pinyin}</p>
-              <p className="meaning">{DAILY_FOCUS.meaning}</p>
-            </div>
+          <div className="token-actions">
             <button
-              className="ghost-button"
               type="button"
-              onClick={() => speak(DAILY_FOCUS.phrase)}
-              disabled={!speechSupported}
+              className="button button--primary"
+              onClick={handleTestSend}
+              disabled={!accessToken || isSendingTest}
             >
-              Play pronunciation
+              {isSendingTest ? '테스트 전송 중...' : '토큰 테스트 메시지 보내기'}
+            </button>
+            <button
+              type="button"
+              className="button button--ghost"
+              onClick={() => {
+                setAccessToken('')
+                setInfoMessage('토큰을 삭제했습니다.')
+              }}
+            >
+              토큰 삭제
             </button>
           </div>
-          <p className="description">{DAILY_FOCUS.description}</p>
-
-          <div className="daily-focus__details">
-            <div>
-              <h3>Breakdown</h3>
-              <ul>
-                {DAILY_FOCUS.breakdown.map((item) => (
-                  <li key={item.part}>
-                    <span className="pill pill--hanzi">{item.part}</span>
-                    <span>{item.translation}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div>
-              <h3>Practice ideas</h3>
-              <ul className="bullet-list">
-                {DAILY_FOCUS.practice.map((mission) => (
-                  <li key={mission}>{mission}</li>
-                ))}
-              </ul>
-            </div>
-          </div>
         </section>
 
-        <section className="card flashcard">
-          <div className="section-header">
-            <h2>Flashcards</h2>
-            <span className="badge badge--muted">
-              {currentCardIndex + 1} / {VOCABULARY.length}
-            </span>
-          </div>
-
-          <div className="flashcard__body">
-            <div className="flashcard__meta">
-              <span className={`pill pill--category pill--${currentCard.category}`}>
-                {CATEGORY_LABELS[currentCard.category]}
-              </span>
-              <button
-                className={`ghost-button ghost-button--small ${isCurrentWordKnown ? 'is-active' : ''}`}
-                type="button"
-                onClick={() => toggleKnownWord(currentCard.id)}
-              >
-                {isCurrentWordKnown ? 'Mark for review' : 'Mark as learned'}
-              </button>
+        <section className="card">
+          <h2>메시지 예약</h2>
+          <p className="card__description">
+            기본 텍스트 템플릿으로 예약 메시지를 발송합니다. 링크 영역은 카카오톡 실행 링크로 자동 설정됩니다.
+          </p>
+          <div className="field-grid">
+            <div className="field">
+              <label htmlFor="schedule-date">날짜</label>
+              <input
+                id="schedule-date"
+                type="date"
+                value={scheduleDate}
+                onChange={(event) => setScheduleDate(event.target.value)}
+              />
             </div>
-
-            <div className="flashcard__content">
-              <h3>{currentCard.hanzi}</h3>
-              <p className="pinyin">{currentCard.pinyin}</p>
-              <p className="meaning">{currentCard.meaning}</p>
-              <div className="flashcard__actions">
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => speak(currentCard.hanzi)}
-                  disabled={!speechSupported}
-                >
-                  Play pronunciation
-                </button>
-                <button
-                  className="ghost-button"
-                  type="button"
-                  onClick={() => speak(currentCard.meaning, 'en-US')}
-                >
-                  Play meaning
-                </button>
-              </div>
-            </div>
-
-            <div className="flashcard__examples">
-              <h4>Example sentences</h4>
-              <ul>
-                {currentCard.examples.map((example) => (
-                  <li key={example.hanzi}>
-                    <p className="hanzi">{example.hanzi}</p>
-                    <p className="pinyin">{example.pinyin}</p>
-                    <p className="translation">{example.translation}</p>
-                  </li>
-                ))}
-              </ul>
-              {currentCard.tip && <p className="tip">?? {currentCard.tip}</p>}
-            </div>
-
-            <div className="flashcard__nav">
-              <button className="ghost-button" type="button" onClick={handlePrevCard}>
-                Previous
-              </button>
-              <button className="primary-button" type="button" onClick={handleNextCard}>
-                Next
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <section className="card quiz">
-          <div className="section-header">
-            <h2>Multiple-choice quiz</h2>
-            <p className="section-subtitle">Match the correct meaning</p>
-          </div>
-
-          <div className="quiz__question">
-            <p className="quiz__prompt">{quizQuestion.word.hanzi}</p>
-            <p className="pinyin">{quizQuestion.word.pinyin}</p>
-          </div>
-
-          <div className="quiz__options">
-            {quizQuestion.options.map((option) => {
-              const isSelected = selectedOption === option
-              const isCorrect = quizQuestion.word.meaning === option
-              return (
-                <button
-                  key={option}
-                  type="button"
-                  className={`quiz__option ${
-                    selectedOption
-                      ? isCorrect
-                        ? 'quiz__option--correct'
-                        : isSelected
-                          ? 'quiz__option--incorrect'
-                          : ''
-                      : ''
-                  } ${isSelected ? 'is-selected' : ''}`}
-                  onClick={() => handleQuizOptionSelect(option)}
-                  disabled={Boolean(selectedOption)}
-                >
-                  {option}
-                </button>
-              )
-            })}
-          </div>
-
-          {quizResult && (
-            <div className={`quiz__result quiz__result--${quizResult}`}>
-              {quizResult === 'correct'
-                ? 'Great job! Keep stacking accurate recall.'
-                : 'Not quite. Review the flashcard and try the next one.'}
-              <div className="quiz__answer-detail">
-                <p>
-                  Correct answer: <strong>{quizQuestion.word.meaning}</strong>
-                </p>
-                {quizQuestion.word.examples[0] && (
-                  <p>
-                    Example: {quizQuestion.word.examples[0].hanzi} ({
-                      quizQuestion.word.examples[0].translation
-                    })
-                  </p>
-                )}
-              </div>
-            </div>
-          )}
-
-          <button className="primary-button quiz__next" type="button" onClick={handleNextQuizQuestion}>
-            Next question
-          </button>
-        </section>
-
-        <section className="card lessons">
-          <div className="section-header">
-            <h2>Mini lessons</h2>
-            <p className="section-subtitle">Key pronunciation and grammar takeaways</p>
-          </div>
-          <div className="grid grid--two">
-            {MINI_LESSONS.map((lesson) => (
-              <article key={lesson.title} className="info-card">
-                <h3>{lesson.title}</h3>
-                <p className="info-card__concept">{lesson.concept}</p>
-                <p className="info-card__takeaway">{lesson.takeaway}</p>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section className="card patterns">
-          <div className="section-header">
-            <h2>Conversation patterns</h2>
-            <p className="section-subtitle">Plug-and-play structures for daily talk</p>
-          </div>
-          <div className="patterns__list">
-            {CONVERSATION_PATTERNS.map((pattern) => (
-              <article key={pattern.title} className="pattern-card">
-                <h3>{pattern.title}</h3>
-                <p className="pattern-card__pattern">{pattern.pattern}</p>
-                <p className="pattern-card__example">Example: {pattern.example}</p>
-                <p className="pattern-card__tip">Tip. {pattern.tip}</p>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section className="card scenarios">
-          <div className="section-header">
-            <h2>Situational dialogues</h2>
-            <p className="section-subtitle">Short scripts for real-life moments</p>
-          </div>
-          <div className="grid grid--two">
-            {SCENARIOS.map((scenario) => (
-              <article key={scenario.title} className="scenario-card">
-                <h3>{scenario.title}</h3>
-                <ul>
-                  {scenario.dialogue.map((line, index) => (
-                    <li key={`${line.speaker}-${index}`}>
-                      <p className="hanzi">
-                        {line.speaker}: {line.hanzi}
-                      </p>
-                      <p className="pinyin">{line.pinyin}</p>
-                      <p className="translation">{line.translation}</p>
-                    </li>
-                  ))}
-                </ul>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section className="card progress">
-          <div className="section-header">
-            <h2>Progress & categories</h2>
-          </div>
-          <div className="progress__summary">
-            <div
-              className="progress__ring"
-              style={{
-                '--progress-angle': `${Math.min(progress, 100) * 3.6}deg`,
-              } as CSSProperties}
-            >
-              <span>{progress}%</span>
-              <p>Learned words</p>
-            </div>
-            <p>
-              Words marked as learned are saved locally. Toggle them anytime to keep your review list
-              honest.
-            </p>
-          </div>
-          <div className="grid grid--two">
-            {Object.entries(vocabularyByCategory).map(([category, words]) => (
-              <article key={category} className="category-card">
-                <h3>{CATEGORY_LABELS[category as Category]}</h3>
-                <ul>
-                  {words.map((word) => (
-                    <li key={word.id}>
-                      <span>{word.hanzi}</span>
-                      <span className="pinyin">{word.pinyin}</span>
-                      <span className="translation">{word.meaning}</span>
-                    </li>
-                  ))}
-                </ul>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section className="card study-support">
-          <div className="section-header">
-            <h2>Study routine & notes</h2>
-          </div>
-          <div className="grid grid--two">
-            <div>
-              {STUDY_ROUTINE.map((routine) => (
-                <article key={routine.title} className="routine-card">
-                  <div className="routine-card__header">
-                    <h3>{routine.title}</h3>
-                    <span className="badge badge--muted">{routine.duration}</span>
-                  </div>
-                  <ul className="bullet-list">
-                    {routine.tasks.map((task) => (
-                      <li key={task}>{task}</li>
-                    ))}
-                  </ul>
-                </article>
-              ))}
-            </div>
-            <div>
-              <label className="notes__label" htmlFor="notes">
-                Learning notes
-              </label>
-              <textarea
-                id="notes"
-                className="notes__textarea"
-                placeholder="Capture pronunciation tips, new phrases, or study reminders."
-                value={notes}
-                onChange={(event) => setNotes(event.target.value)}
+            <div className="field">
+              <label htmlFor="schedule-time">시간</label>
+              <input
+                id="schedule-time"
+                type="time"
+                value={scheduleTime}
+                onChange={(event) => setScheduleTime(event.target.value)}
               />
             </div>
           </div>
+          <div className="field">
+            <label htmlFor="message">메시지 내용</label>
+            <textarea
+              id="message"
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="예약 메시지를 입력하세요. (최대 1000자)"
+              rows={4}
+            />
+          </div>
+          <div className="actions">
+            <button type="button" className="button button--primary" onClick={handleScheduleMessage}>
+              메시지 예약 추가
+            </button>
+            <button type="button" className="button button--ghost" onClick={() => setMessage('')}>
+              내용 초기화
+            </button>
+          </div>
+          {formError && <p className="alert alert--error">{formError}</p>}
+          {infoMessage && <p className="alert alert--info">{infoMessage}</p>}
         </section>
 
-        <section className="card culture">
-          <div className="section-header">
-            <h2>Culture notes</h2>
-            <p className="section-subtitle">Understand the etiquette behind the language</p>
+        <section className="card">
+          <div className="card__header">
+            <div>
+              <h2>예약 내역</h2>
+              <p className="card__description">
+                예약된 메시지는 로컬 스토리지에 저장됩니다. 장시간 예약은 창을 닫으면 전송되지 않으니 주의하세요.
+              </p>
+            </div>
+            <div className="card__actions">
+              <button
+                type="button"
+                className="button button--ghost"
+                onClick={handleBulkClear}
+                disabled={!schedules.some((item) => item.status !== 'pending' && item.status !== 'sending')}
+              >
+                완료/실패 항목 정리
+              </button>
+            </div>
           </div>
-          <div className="grid grid--two">
-            {CULTURAL_NOTES.map((note) => (
-              <article key={note.title} className="info-card">
-                <h3>{note.title}</h3>
-                <p>{note.content}</p>
-                <p className="info-card__takeaway">? {note.takeaway}</p>
-              </article>
-            ))}
-          </div>
+
+          {schedules.length === 0 ? (
+            <p className="empty">예약된 메시지가 없습니다.</p>
+          ) : (
+            <ul className="schedule-list">
+              {schedules.map((item) => (
+                <li key={item.id} className={`schedule schedule--${item.status}`}>
+                  <div className="schedule__meta">
+                    <span className="schedule__status">{item.status}</span>
+                    <span className="schedule__time">{formatDateTime(item.scheduledAt)}</span>
+                    {item.status === 'sent' && item.sentAt && (
+                      <span className="schedule__time schedule__time--sub">
+                        전송 완료: {formatDateTime(item.sentAt)}
+                      </span>
+                    )}
+                    {item.status === 'failed' && item.error && (
+                      <span className="schedule__error">실패 사유: {item.error}</span>
+                    )}
+                  </div>
+                  <pre className="schedule__message">{item.message}</pre>
+                  <div className="schedule__actions">
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      onClick={() => handleSendNow(item.id)}
+                      disabled={
+                        item.status !== 'pending' || processingRef.current.has(item.id) || !accessToken
+                      }
+                    >
+                      지금 보내기
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      onClick={() => handleCancel(item.id)}
+                      disabled={item.status !== 'pending'}
+                    >
+                      예약 취소
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      onClick={() => handleRetry(item.id)}
+                      disabled={item.status !== 'failed'}
+                    >
+                      재시도
+                    </button>
+                    <button type="button" className="button button--danger" onClick={() => handleDelete(item.id)}>
+                      삭제
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
 
-        <section className="card resources">
-          <div className="section-header">
-            <h2>Recommended resources</h2>
-            <p className="section-subtitle">Extend listening, tone work, and input</p>
-          </div>
-          <ul className="resources__list">
-            {RESOURCE_LINKS.map((resource) => (
-              <li key={resource.name}>
-                <h3>{resource.name}</h3>
-                <p>{resource.description}</p>
-                <a href={resource.url} target="_blank" rel="noreferrer">
-                  Open site ?
-                </a>
-              </li>
-            ))}
+        <section className="card">
+          <h2>사용 가이드</h2>
+          <ul className="guide-list">
+            <li>
+              카카오 디벨로퍼스에서 애플리케이션을 등록하고 사용자 토큰 발급 권한(카카오톡 메시지)을
+              활성화해야 합니다.
+            </li>
+            <li>
+              액세스 토큰은 최대 6시간 유지됩니다. 만료되면 새 토큰으로 갱신하고 토큰 테스트 전송으로 확인하세요.
+            </li>
+            <li>현재 구현은 &ldquo;나에게 보내기&rdquo; 기본 텍스트 템플릿만 지원합니다.</li>
+            <li>브라우저가 종료되거나 절전 상태가 되면 예약 실행이 중단됩니다. 실서비스에는 서버/워커 구성이 필요합니다.</li>
+            <li>카카오 정책에 따라 메시지 전송량과 사용 목적을 반드시 준수하세요.</li>
           </ul>
         </section>
       </main>
-
-      {!speechSupported && (
-        <p className="speech-warning">
-          Speech synthesis is not available in this browser, so the pronunciation buttons are
-          disabled.
-        </p>
-      )}
     </div>
   )
 }
