@@ -14,6 +14,7 @@ import {
   type Category,
   type VocabularyItem,
 } from './data/lessons'
+import ScheduledMessageComponent from './components/ScheduledMessage'
 
 type QuizQuestion = {
   word: VocabularyItem
@@ -157,6 +158,8 @@ function App() {
       </header>
 
       <main className="content">
+        <ScheduledMessageComponent />
+
         <section className="card daily-focus">
           <div className="section-header">
             <h2>Daily focus</h2>
